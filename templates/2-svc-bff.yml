@@ -1,0 +1,113 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Parameters:
+  AppId:
+    Description: An application ID that is prefixed to resource names
+    Type: String
+
+  EnvId:
+    Description: An environment ID that is prefixed to resource names
+    Type: String
+
+  ImageTag:
+    Description: An image tag that is used in ECS task definition
+    Type: String
+
+Resources:
+  #----------------------------------------------------------#
+  # BFF
+  #----------------------------------------------------------#
+  BffEcsService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub "${AppId}-${EnvId}-bff-ecs-service"
+      Cluster: {"Fn::ImportValue": !Sub "${AppId}-${EnvId}-ecs-cluster-id"}
+      LaunchType: FARGATE
+      DesiredCount: 1
+      EnableExecuteCommand: true
+      DeploymentController:
+        Type: ECS
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - {"Fn::ImportValue": !Sub "${AppId}-${EnvId}-private-subnet-1"}
+            - {"Fn::ImportValue": !Sub "${AppId}-${EnvId}-private-subnet-2"}
+          SecurityGroups:
+            - {"Fn::ImportValue": !Sub "${AppId}-${EnvId}-frontend-layer-ecs-sg-id"}
+      TaskDefinition: !Ref BffEcsTaskDefinition
+      LoadBalancers:
+        - TargetGroupArn: {"Fn::ImportValue": !Sub "${AppId}-${EnvId}-bff-alb-tg-arn"}
+          ContainerPort: 80
+          ContainerName: "bff-app"
+      ServiceConnectConfiguration:
+        Enabled: True
+        LogConfiguration: 
+          LogDriver: awslogs
+          Options:
+            awslogs-create-group: True
+            awslogs-group: {"Fn::ImportValue": !Sub "${AppId}-${EnvId}-ecs-log-group-name"}
+            awslogs-region: !Ref AWS::Region
+            awslogs-stream-prefix: backend1
+        Namespace: {"Fn::ImportValue": !Sub "${AppId}-${EnvId}-cloud-map-namespace-name"}
+
+  BffEcsTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      ContainerDefinitions:
+        - Name: "bff-app"
+          Image: !Sub
+            - "${EcrRepositoryUri}:${ImageTag}"
+            - EcrRepositoryUri: {"Fn::ImportValue": !Sub "${AppId}-${EnvId}-bff-ecr-repository-uri"}
+              ImageTag: !Ref ImageTag
+          Environment:
+            - Name: BACKEND_1_URL
+              Value: !Sub
+                - http://${Backend1ServiceName}.${Namespace}
+                - Backend1ServiceName: {"Fn::ImportValue": !Sub "${AppId}-${EnvId}-backend1-cloud-map-service-name"}
+                  Namespace: {"Fn::ImportValue": !Sub "${AppId}-${EnvId}-cloud-map-namespace-name"} 
+            - Name: BACKEND_2_URL
+              Value: !Sub
+                - http://${Backend2ServiceName}.${Namespace}
+                - Backend2ServiceName: {"Fn::ImportValue": !Sub "${AppId}-${EnvId}-backend2-cloud-map-service-name"}
+                  Namespace: {"Fn::ImportValue": !Sub "${AppId}-${EnvId}-cloud-map-namespace-name"} 
+          LinuxParameters:
+            InitProcessEnabled: True
+          PortMappings:
+            - ContainerPort: 80
+              Name: web
+              Protocol: tcp
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-create-group: True
+              awslogs-group: {"Fn::ImportValue": !Sub "${AppId}-${EnvId}-ecs-log-group-name"}
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: bff
+        #------------------------------------------------------------#
+        # X-Ray daemon container (side-car) definition for ECS Task
+        # - https://docs.aws.amazon.com/xray/latest/devguide/xray-daemon-ecs.html
+        # - https://gallery.ecr.aws/xray/aws-xray-daemon
+        #------------------------------------------------------------#
+        - Name: "bff-xray-daemon"
+          Image: public.ecr.aws/xray/aws-xray-daemon
+          PortMappings:
+            - ContainerPort: 2000
+              Protocol: udp
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-create-group: True
+              awslogs-group: {"Fn::ImportValue": !Sub "${AppId}-${EnvId}-ecs-log-group-name"}
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: bff
+        #------------------------------------------------------------#
+      Family: !Sub "${AppId}-${EnvId}-bff"
+      Cpu: 1024
+      Memory: 2048
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: {"Fn::ImportValue": !Sub "${AppId}-${EnvId}-ecs-task-execution-role-arn"}
+      TaskRoleArn: {"Fn::ImportValue": !Sub "${AppId}-${EnvId}-ecs-task-role-arn"}
+  #----------------------------------------------------------#
