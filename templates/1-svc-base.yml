@@ -1,0 +1,387 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Parameters:
+  AppId:
+    Description: An application ID that is prefixed to resource names
+    Type: String
+
+  EnvId:
+    Description: An environment ID that is prefixed to resource names
+    Type: String
+
+Resources:
+  #----------------------------------------------------------#
+  # Security Groups
+  #----------------------------------------------------------#
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Security Group for ALB"
+      GroupName: !Sub "${AppId}-${EnvId}-commmon-alb-sg"
+      VpcId: {"Fn::ImportValue": !Sub "${AppId}-${EnvId}-vpc-id"}
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  FrontendLayerEcsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Security Group for Frontend Layer ECS"
+      GroupName: !Sub "${AppId}-${EnvId}-frontend-layer-ecs-sg"
+      VpcId: {"Fn::ImportValue": !Sub "${AppId}-${EnvId}-vpc-id"}
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !GetAtt AlbSecurityGroup.GroupId
+
+  BackendLayerEcsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Security Group for Backend Layer ECS"
+      GroupName: !Sub "${AppId}-${EnvId}-backend-layer-ecs-sg"
+      VpcId: {"Fn::ImportValue": !Sub "${AppId}-${EnvId}-vpc-id"}
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !GetAtt FrontendLayerEcsSecurityGroup.GroupId
+  #----------------------------------------------------------#
+
+
+  #----------------------------------------------------------#
+  # IAM Roles
+  #----------------------------------------------------------#
+  EcsTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AppId}-${EnvId}-ecs-task-execution-role"
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  EcsTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AppId}-${EnvId}-ecs-task-role"
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        #------------------------------------------------------------#
+        # Required role for X-Ray daemon container in ECS Task
+        # - https://docs.aws.amazon.com/ja_jp/xray/latest/devguide/security_iam_id-based-policy-examples.html
+        #------------------------------------------------------------#
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+        #------------------------------------------------------------#
+        - arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess
+      Policies:
+        - PolicyName: EcsExecPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssmmessages:CreateControlChannel
+                  - ssmmessages:CreateDataChannel
+                  - ssmmessages:OpenControlChannel
+                  - ssmmessages:OpenDataChannel
+                  - logs:CreateLogStream
+                  - logs:DescribeLogStreams
+                  - logs:PutLogEvents
+                Resource: "*"
+  #----------------------------------------------------------#
+
+
+  #----------------------------------------------------------#
+  # ECR Repositories
+  #----------------------------------------------------------#
+  FrontendEcrRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${AppId}-${EnvId}-frontend"
+
+  BffEcrRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${AppId}-${EnvId}-bff"
+
+  Backend1EcrRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${AppId}-${EnvId}-backend1"
+
+  Backend2EcrRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${AppId}-${EnvId}-backend2"
+  #----------------------------------------------------------#
+
+
+  #----------------------------------------------------------#
+  # ALB
+  #----------------------------------------------------------#
+  Alb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${AppId}-${EnvId}"
+      Scheme: internet-facing
+      Subnets:
+        - {"Fn::ImportValue": !Sub "${AppId}-${EnvId}-public-subnet-1"}
+        - {"Fn::ImportValue": !Sub "${AppId}-${EnvId}-public-subnet-2"}
+      SecurityGroups:
+        - !GetAtt AlbSecurityGroup.GroupId
+
+  AlbListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref FrontendAlbTargetGroup
+      LoadBalancerArn: !Ref Alb
+      Port: 80
+      Protocol: HTTP
+
+  AlbListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      Actions:
+        - TargetGroupArn: !Ref BffAlbTargetGroup
+          Type: forward
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig:
+            Values:
+              - /api/*
+      ListenerArn: !Ref AlbListener
+      Priority: 1
+
+  FrontendAlbTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: {"Fn::ImportValue": !Sub "${AppId}-${EnvId}-vpc-id"}
+      Name: !Sub "${AppId}-${EnvId}-frontend-alb-tg"
+      Protocol: HTTP
+      Port: 80
+      TargetType: ip
+      HealthCheckPath: /health
+      HealthCheckPort: 80
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 10
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      Matcher:
+        HttpCode: 200
+
+  BffAlbTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: {"Fn::ImportValue": !Sub "${AppId}-${EnvId}-vpc-id"}
+      Name: !Sub "${AppId}-${EnvId}-bff-alb-tg"
+      Protocol: HTTP
+      Port: 80
+      TargetType: ip
+      HealthCheckPath: /health
+      HealthCheckPort: 80
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 10
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      Matcher:
+        HttpCode: 200
+  #----------------------------------------------------------#
+
+
+  #----------------------------------------------------------#
+  # ECS
+  #----------------------------------------------------------#
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${AppId}-${EnvId}-ecs-cluster"
+      Configuration:
+        ExecuteCommandConfiguration:
+          Logging: DEFAULT
+
+  EcsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/ecs/${AppId}/${EnvId}"
+  #----------------------------------------------------------#
+
+
+  #----------------------------------------------------------#
+  # Cloud Map
+  #----------------------------------------------------------#
+  CloudMapNamespace:
+    Type: AWS::ServiceDiscovery::PrivateDnsNamespace
+    Properties:
+      Name: !Sub "ecs.${EnvId}.${AppId}.private"
+      Vpc: {"Fn::ImportValue": !Sub "${AppId}-${EnvId}-vpc-id"}
+  #----------------------------------------------------------#
+
+
+  #----------------------------------------------------------#
+  # DynamoDB
+  #----------------------------------------------------------#
+  DynamoDbTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AppId}-${EnvId}-last-accessed"
+      AttributeDefinitions:
+        - AttributeName: SubAppId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: SubAppId
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+  #----------------------------------------------------------#
+
+
+  #------------------------------------------------------------#
+  # X-Ray Sampling rules to disable sampling healthcheck traffic
+  # - https://docs.aws.amazon.com/xray/latest/devguide/xray-console-sampling.html#xray-console-sampling-options
+  #------------------------------------------------------------#
+  XRaySamplingRule:
+    Type: AWS::XRay::SamplingRule
+    Properties:
+      SamplingRule:
+        Version: 1
+        RuleName: !Sub "${AppId}-${EnvId}-ignore-healthcheck"
+        Priority: 1
+        ReservoirSize: 0
+        FixedRate: 0
+        ServiceName: "*"
+        ServiceType: "*"
+        HTTPMethod: "GET"
+        URLPath: "/health"
+        ResourceARN: "*"
+        Host: "*"
+  #------------------------------------------------------------#
+
+Outputs:
+  FrontendLayerEcsSecurityGroupId:
+    Description: A reference to the ID of frontend layer ECS security group
+    Value: !Ref FrontendLayerEcsSecurityGroup
+    Export:
+      Name: !Sub "${AppId}-${EnvId}-frontend-layer-ecs-sg-id"
+
+  BackendLayerEcsSecurityGroupId:
+    Description: A reference to the ID of backend layer ECS security group
+    Value: !Ref BackendLayerEcsSecurityGroup
+    Export:
+      Name: !Sub "${AppId}-${EnvId}-backend-layer-ecs-sg-id"
+
+  EcsTaskExecutionRoleArn:
+    Description: A reference to the ARN of common ECS task execution role
+    Value: !GetAtt EcsTaskExecutionRole.Arn
+    Export:
+      Name: !Sub "${AppId}-${EnvId}-ecs-task-execution-role-arn"
+
+  EcsTaskRoleArn:
+    Description: A reference to the ARN of common ECS task role
+    Value: !GetAtt EcsTaskRole.Arn
+    Export:
+      Name: !Sub "${AppId}-${EnvId}-ecs-task-role-arn"
+
+  FrontendEcrRepositoryUri:
+    Description: A reference to the URI of frontend ECR repository
+    Value: !GetAtt FrontendEcrRepository.RepositoryUri
+    Export:
+      Name: !Sub "${AppId}-${EnvId}-frontend-ecr-repository-uri"
+
+  BffEcrRepositoryUri:
+    Description: A reference to the URI of bff ECR repository
+    Value: !GetAtt BffEcrRepository.RepositoryUri
+    Export:
+      Name: !Sub "${AppId}-${EnvId}-bff-ecr-repository-uri"
+
+  Backend1EcrRepositoryUri:
+    Description: A reference to the URI of backend1 ECR repository
+    Value: !GetAtt Backend1EcrRepository.RepositoryUri
+    Export:
+      Name: !Sub "${AppId}-${EnvId}-backend1-ecr-repository-uri"
+
+  Backend2EcrRepositoryUri:
+    Description: A reference to the URI of backend2 ECR repository
+    Value: !GetAtt Backend2EcrRepository.RepositoryUri
+    Export:
+      Name: !Sub "${AppId}-${EnvId}-backend2-ecr-repository-uri"
+
+  AlbDnsName:
+    Description: A reference to the DNS name of common ALB
+    Value: !GetAtt Alb.DNSName
+    Export:
+      Name: !Sub "${AppId}-${EnvId}-alb-dns-name"
+
+  FrontendAlbTargetGroupArn:
+    Description: A reference to the ARN of frontend ALB target group
+    Value: !Ref FrontendAlbTargetGroup
+    Export:
+      Name: !Sub "${AppId}-${EnvId}-frontend-alb-tg-arn"
+
+  BffAlbTargetGroupArn:
+    Description: A reference to the ARN of bff ALB target group
+    Value: !Ref BffAlbTargetGroup
+    Export:
+      Name: !Sub "${AppId}-${EnvId}-bff-alb-tg-arn"
+
+  EcsClusterId:
+    Description: A reference to the ID of common ECS cluster
+    Value: !Ref EcsCluster
+    Export:
+      Name: !Sub "${AppId}-${EnvId}-ecs-cluster-id"
+
+  EcsLogGroupName:
+    Description: A reference to the Name of common ECS log group
+    Value: !Ref EcsLogGroup
+    Export:
+      Name: !Sub "${AppId}-${EnvId}-ecs-log-group-name"
+
+  CloudMapNamespaceName:
+    Description: A reference to the Name of service discovery DNS namespace
+    Value: !Sub "ecs.${EnvId}.${AppId}.private"
+    Export:
+      Name: !Sub "${AppId}-${EnvId}-cloud-map-namespace-name"
+
+  BffCloudMapServiceName:
+    Description: A reference to the Name of bff service in service discovery DNS namespace
+    Value: bff
+    Export:
+      Name: !Sub "${AppId}-${EnvId}-bff-cloud-map-service-name"
+
+  Backend1CloudMapServiceName:
+    Description: A reference to the Name of backend1 service in service discovery DNS namespace
+    Value: backend1
+    Export:
+      Name: !Sub "${AppId}-${EnvId}-backend1-cloud-map-service-name"
+
+  Backend2CloudMapServiceName:
+    Description: A reference to the Name of backend2 service in service discovery DNS namespace
+    Value: backend2
+    Export:
+      Name: !Sub "${AppId}-${EnvId}-backend2-cloud-map-service-name"
+
+  DynamoDbTableName:
+    Description: A reference to the name of common DynamoDB table
+    Value: !Ref DynamoDbTable
+    Export:
+      Name: !Sub "${AppId}-${EnvId}-dynamodb-table-name"

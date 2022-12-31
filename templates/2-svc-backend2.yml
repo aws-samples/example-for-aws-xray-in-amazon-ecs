@@ -1,0 +1,120 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Parameters:
+  AppId:
+    Description: An application ID that is prefixed to resource names
+    Type: String
+
+  EnvId:
+    Description: An environment ID that is prefixed to resource names
+    Type: String
+
+  ImageTag:
+    Description: An image tag that is used in ECS task definition
+    Type: String
+
+Resources:
+  #----------------------------------------------------------#
+  # Backend2
+  #----------------------------------------------------------#
+  Backend2EcsService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub "${AppId}-${EnvId}-backend2-ecs-service"
+      Cluster: {"Fn::ImportValue": !Sub "${AppId}-${EnvId}-ecs-cluster-id"}
+      LaunchType: FARGATE
+      DesiredCount: 1
+      EnableExecuteCommand: true
+      DeploymentController:
+        Type: ECS
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - {"Fn::ImportValue": !Sub "${AppId}-${EnvId}-private-subnet-1"}
+            - {"Fn::ImportValue": !Sub "${AppId}-${EnvId}-private-subnet-2"}
+          SecurityGroups:
+            - {"Fn::ImportValue": !Sub "${AppId}-${EnvId}-backend-layer-ecs-sg-id"}
+      TaskDefinition: !Ref Backend2EcsTaskDefinition
+      ServiceConnectConfiguration:
+        Enabled: True
+        LogConfiguration: 
+          LogDriver: awslogs
+          Options:
+            awslogs-create-group: True
+            awslogs-group: {"Fn::ImportValue": !Sub "${AppId}-${EnvId}-ecs-log-group-name"}
+            awslogs-region: !Ref AWS::Region
+            awslogs-stream-prefix: backend2
+        Namespace: {"Fn::ImportValue": !Sub "${AppId}-${EnvId}-cloud-map-namespace-name"}
+        Services:
+          - ClientAliases:
+              - DnsName: !Sub
+                  - ${Backend2ServiceName}.${Namespace}
+                  - Backend2ServiceName: {"Fn::ImportValue": !Sub "${AppId}-${EnvId}-backend2-cloud-map-service-name"}
+                    Namespace: {"Fn::ImportValue": !Sub "${AppId}-${EnvId}-cloud-map-namespace-name"}
+                Port: 80
+            DiscoveryName: backend2
+            PortName: web
+
+  Backend2EcsTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      ContainerDefinitions:
+        - Name: "backend2-app"
+          Image: !Sub
+            - "${EcrRepositoryUri}:${ImageTag}"
+            - EcrRepositoryUri: {"Fn::ImportValue": !Sub "${AppId}-${EnvId}-backend2-ecr-repository-uri"}
+              ImageTag: !Ref ImageTag
+          Environment:
+            - Name: DYNAMO_DB_TABLE_NAME
+              Value: {"Fn::ImportValue": !Sub "${AppId}-${EnvId}-dynamodb-table-name"}
+            - Name: AWS_DEFAULT_REGION
+              Value: !Ref AWS::Region
+          LinuxParameters:
+            InitProcessEnabled: True
+          PortMappings:
+            - ContainerPort: 80
+              Name: web
+              Protocol: tcp
+          HealthCheck:
+            Command:
+              - "CMD-SHELL"
+              - "curl -f http://localhost/health || exit 1"
+            Interval: 10
+            Timeout: 5
+            StartPeriod: 10
+            Retries: 2
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-create-group: True
+              awslogs-group: {"Fn::ImportValue": !Sub "${AppId}-${EnvId}-ecs-log-group-name"}
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: backend2
+        #------------------------------------------------------------#
+        # X-Ray daemon container (side-car) definition for ECS Task
+        # - https://docs.aws.amazon.com/xray/latest/devguide/xray-daemon-ecs.html
+        # - https://gallery.ecr.aws/xray/aws-xray-daemon
+        #------------------------------------------------------------#
+        - Name: "backend2-xray-daemon"
+          Image: public.ecr.aws/xray/aws-xray-daemon
+          PortMappings:
+            - ContainerPort: 2000
+              Protocol: udp
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-create-group: True
+              awslogs-group: {"Fn::ImportValue": !Sub "${AppId}-${EnvId}-ecs-log-group-name"}
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: backend2
+        #------------------------------------------------------------#
+      Family: !Sub "${AppId}-${EnvId}-backend2"
+      Cpu: 1024
+      Memory: 2048
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: {"Fn::ImportValue": !Sub "${AppId}-${EnvId}-ecs-task-execution-role-arn"}
+      TaskRoleArn: {"Fn::ImportValue": !Sub "${AppId}-${EnvId}-ecs-task-role-arn"}
+  #----------------------------------------------------------#
